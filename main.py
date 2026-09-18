@@ -85,11 +85,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             full_name TEXT NOT NULL,
+            role TEXT DEFAULT NULL,
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # Qo'shimcha urinish so'rovlari
+    # role ustuni yo'q bo'lsa qo'shamiz
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS attempt_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,7 +126,7 @@ class TeacherStates(StatesGroup):
 class StudentStates(StatesGroup):
     waiting_for_test_code = State()
     waiting_for_student_answers = State()
-    waiting_for_attempt_reason = State()   # yangi
+    waiting_for_attempt_reason = State()
 
 class AdminStates(StatesGroup):
     waiting_for_channel_id = State()
@@ -141,13 +147,44 @@ def get_user_fullname(user_id: int) -> Optional[str]:
     return row[0] if row else None
 
 
+def get_user_role(user_id: int) -> Optional[str]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
 def save_user_fullname(user_id: int, full_name: str):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT OR REPLACE INTO users (user_id, full_name) VALUES (?, ?)",
-        (user_id, full_name)
+        "INSERT OR REPLACE INTO users (user_id, full_name, role) VALUES (?, ?, COALESCE((SELECT role FROM users WHERE user_id = ?), NULL))",
+        (user_id, full_name, user_id)
     )
+    # Agar yangi bo'lsa
+    cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+    if not cursor.fetchone():
+        cursor.execute("INSERT INTO users (user_id, full_name) VALUES (?, ?)", (user_id, full_name))
+    else:
+        cursor.execute("UPDATE users SET full_name = ? WHERE user_id = ?", (full_name, user_id))
+    conn.commit()
+    conn.close()
+
+
+def set_user_role(user_id: int, role: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+    conn.commit()
+    conn.close()
+
+
+def clear_user_role(user_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET role = NULL WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
@@ -198,11 +235,11 @@ async def get_subscription_markup() -> InlineKeyboardMarkup:
 
 
 # ================== KEYBOARDLAR ==================
-def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
+def role_select_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     buttons = [
         [
-            InlineKeyboardButton(text="👨‍🏫 O'qituvchi", callback_data="role_teacher"),
-            InlineKeyboardButton(text="👨‍🎓 O'quvchi", callback_data="role_student"),
+            InlineKeyboardButton(text="👨‍🏫 O'qituvchi", callback_data="set_role_teacher"),
+            InlineKeyboardButton(text="👨‍🎓 O'quvchi", callback_data="set_role_student"),
         ]
     ]
     if is_admin:
@@ -301,6 +338,29 @@ def format_ranking(results: list, test_name: str, test_code: str) -> str:
     return text
 
 
+async def show_home_by_role(message_or_callback, user_id: int, edit: bool = False):
+    """Rolga qarab bosh sahifani ko'rsatadi"""
+    role = get_user_role(user_id)
+    full_name = get_user_fullname(user_id) or "Foydalanuvchi"
+    is_admin = user_id == SUPER_ADMIN_ID
+
+    if role == "teacher":
+        text = f"👨‍🏫 <b>O'qituvchi paneli</b>\n\nAssalomu alaykum, <b>{full_name}</b>!\nKerakli amalni tanlang:"
+        kb = teacher_panel()
+    elif role == "student":
+        text = f"👨‍🎓 <b>O'quvchi paneli</b>\n\nAssalomu alaykum, <b>{full_name}</b>!\nKerakli amalni tanlang:"
+        kb = student_panel()
+    else:
+        text = f"Assalomu alaykum, <b>{full_name}</b>!\n\nIltimos, o'z rolingizni tanlang:"
+        kb = role_select_kb(is_admin)
+
+    if edit and hasattr(message_or_callback, "message"):
+        await message_or_callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        target = message_or_callback if isinstance(message_or_callback, Message) else message_or_callback.message
+        await target.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
 # ================== START VA RO'YXATDAN O'TISH ==================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
@@ -328,14 +388,21 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         await state.set_state(RegisterStates.waiting_for_fullname)
         return
 
-    is_admin = message.from_user.id == SUPER_ADMIN_ID
-    await message.answer(
-        f"Assalomu alaykum, <b>{full_name}</b>! 👋\n"
-        "Test botiga xush kelibsiz.\n\n"
-        "Iltimos, o'z rolingizni tanlang:",
-        reply_markup=main_menu(is_admin),
-        parse_mode=ParseMode.HTML
-    )
+    # Rol bor-yo'qligini tekshiramiz
+    role = get_user_role(message.from_user.id)
+    if role:
+        # Rol allaqachon tanlangan → to'g'ridan-to'g'ri panelga
+        await show_home_by_role(message, message.from_user.id)
+    else:
+        # Rol tanlanmagan → tanlashni so'raymiz
+        is_admin = message.from_user.id == SUPER_ADMIN_ID
+        await message.answer(
+            f"Assalomu alaykum, <b>{full_name}</b>! 👋\n\n"
+            "Iltimos, o'z rolingizni tanlang:\n"
+            "(Keyin o'zgartirish uchun /swap yuboring)",
+            reply_markup=role_select_kb(is_admin),
+            parse_mode=ParseMode.HTML
+        )
 
 
 @router.message(RegisterStates.waiting_for_fullname)
@@ -345,14 +412,24 @@ async def process_fullname(message: Message, state: FSMContext):
         await message.answer("Ism-familiya juda qisqa. To'liq yozing (masalan: Ali Valiyev) yoki /cancel")
         return
 
-    save_user_fullname(message.from_user.id, name)
+    # Ismni saqlaymiz (rol hali yo'q)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO users (user_id, full_name, role) VALUES (?, ?, NULL)",
+        (message.from_user.id, name)
+    )
+    conn.commit()
+    conn.close()
+
     await state.clear()
 
     is_admin = message.from_user.id == SUPER_ADMIN_ID
     await message.answer(
         f"✅ Rahmat, <b>{name}</b>!\n\n"
-        "Endi o'z rolingizni tanlang:",
-        reply_markup=main_menu(is_admin),
+        "Endi o'z rolingizni tanlang:\n"
+        "(Keyin o'zgartirish uchun /swap yuboring)",
+        reply_markup=role_select_kb(is_admin),
         parse_mode=ParseMode.HTML
     )
 
@@ -372,30 +449,76 @@ async def check_sub_callback(callback: CallbackQuery, bot: Bot, state: FSMContex
             await callback.answer("Obuna tasdiqlandi!")
             return
 
-        is_admin = callback.from_user.id == SUPER_ADMIN_ID
-        await callback.message.edit_text(
-            f"✅ Rahmat! Obuna tasdiqlandi.\n\n"
-            f"Assalomu alaykum, <b>{full_name}</b>!\n"
-            "Rolingizni tanlang:",
-            reply_markup=main_menu(is_admin),
-            parse_mode=ParseMode.HTML
-        )
+        role = get_user_role(callback.from_user.id)
+        if role:
+            await show_home_by_role(callback, callback.from_user.id, edit=True)
+        else:
+            is_admin = callback.from_user.id == SUPER_ADMIN_ID
+            await callback.message.edit_text(
+                f"✅ Rahmat! Obuna tasdiqlandi.\n\n"
+                f"Assalomu alaykum, <b>{full_name}</b>!\n"
+                "Rolingizni tanlang:",
+                reply_markup=role_select_kb(is_admin),
+                parse_mode=ParseMode.HTML
+            )
         await callback.answer("Obuna tasdiqlandi!")
     else:
         await callback.answer("❌ Siz hali barcha kanallarga obuna bo'lmadingiz!", show_alert=True)
 
 
+# ========== ROL TANLASH ==========
+@router.callback_query(F.data == "set_role_teacher")
+async def set_role_teacher(callback: CallbackQuery):
+    set_user_role(callback.from_user.id, "teacher")
+    full_name = get_user_fullname(callback.from_user.id) or "O'qituvchi"
+    await callback.message.edit_text(
+        f"✅ Rol saqlandi: <b>O'qituvchi</b>\n\n"
+        f"Assalomu alaykum, <b>{full_name}</b>!\n"
+        f"Kerakli amalni tanlang:\n\n"
+        f"<i>Rolni o'zgartirish uchun /swap yuboring</i>",
+        reply_markup=teacher_panel(),
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer("O'qituvchi roli tanlandi!")
+
+
+@router.callback_query(F.data == "set_role_student")
+async def set_role_student(callback: CallbackQuery):
+    set_user_role(callback.from_user.id, "student")
+    full_name = get_user_fullname(callback.from_user.id) or "O'quvchi"
+    await callback.message.edit_text(
+        f"✅ Rol saqlandi: <b>O'quvchi</b>\n\n"
+        f"Assalomu alaykum, <b>{full_name}</b>!\n"
+        f"Kerakli amalni tanlang:\n\n"
+        f"<i>Rolni o'zgartirish uchun /swap yuboring</i>",
+        reply_markup=student_panel(),
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer("O'quvchi roli tanlandi!")
+
+
+# ========== /swap — ROLNI O'ZGARTIRISH ==========
+@router.message(Command("swap"))
+async def cmd_swap(message: Message, state: FSMContext):
+    await state.clear()
+    clear_user_role(message.from_user.id)
+
+    full_name = get_user_fullname(message.from_user.id) or "Foydalanuvchi"
+    is_admin = message.from_user.id == SUPER_ADMIN_ID
+
+    await message.answer(
+        f"🔄 Rol o'zgartirish\n\n"
+        f"Assalomu alaykum, <b>{full_name}</b>!\n"
+        f"Yangi rolingizni tanlang:",
+        reply_markup=role_select_kb(is_admin),
+        parse_mode=ParseMode.HTML
+    )
+
+
 @router.callback_query(F.data == "back_home")
 async def back_home(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    is_admin = callback.from_user.id == SUPER_ADMIN_ID
-    full_name = get_user_fullname(callback.from_user.id) or "Foydalanuvchi"
-    await callback.message.edit_text(
-        f"Assalomu alaykum, <b>{full_name}</b>!\n"
-        "Iltimos, o'z rolingizni tanlang:",
-        reply_markup=main_menu(is_admin),
-        parse_mode=ParseMode.HTML
-    )
+    await show_home_by_role(callback, callback.from_user.id, edit=True)
     await callback.answer()
 
 
@@ -406,7 +529,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
         await message.answer("Hech qanday jarayon yo'q.")
         return
     await state.clear()
-    is_admin = message.from_user.id == SUPER_ADMIN_ID
+
     full_name = get_user_fullname(message.from_user.id)
     if not full_name:
         await message.answer(
@@ -417,10 +540,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
         await state.set_state(RegisterStates.waiting_for_fullname)
         return
 
-    await message.answer(
-        "❌ Jarayon bekor qilindi.\n\nRolingizni tanlang:",
-        reply_markup=main_menu(is_admin)
-    )
+    await show_home_by_role(message, message.from_user.id)
 
 
 # ================== SUPER ADMIN ==================
@@ -576,12 +696,10 @@ async def remove_channel_action(callback: CallbackQuery):
 # ================== O'QITUVCHI ==================
 @router.callback_query(F.data == "role_teacher")
 async def role_teacher(callback: CallbackQuery, state: FSMContext):
+    # Eski tugma (agar qolgan bo'lsa) — endi set_role_teacher ishlatiladi
+    set_user_role(callback.from_user.id, "teacher")
     await state.clear()
-    await callback.message.edit_text(
-        "👨‍🏫 <b>O'qituvchi bo'limi</b>\n\nKerakli amalni tanlang:",
-        reply_markup=teacher_panel(),
-        parse_mode=ParseMode.HTML
-    )
+    await show_home_by_role(callback, callback.from_user.id, edit=True)
     await callback.answer()
 
 
@@ -704,7 +822,7 @@ async def my_tests(callback: CallbackQuery):
                 callback_data=f"test_info_{code}"
             )
         ])
-    keyboard.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="role_teacher")])
+    keyboard.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="back_home")])
 
     await callback.message.edit_text(
         "📋 <b>Sizning testlaringiz</b> (oxirgi 30 ta):\n"
@@ -968,7 +1086,7 @@ async def reopen_test(callback: CallbackQuery):
         "Endi o'quvchilar yana javob yuborishi mumkin.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Mening testlarim", callback_data="my_tests")],
-            [InlineKeyboardButton(text="◀️ O'qituvchi paneli", callback_data="role_teacher")],
+            [InlineKeyboardButton(text="◀️ O'qituvchi paneli", callback_data="back_home")],
         ]),
         parse_mode=ParseMode.HTML
     )
@@ -993,7 +1111,7 @@ async def finish_test_menu(callback: CallbackQuery):
     for code, name in tests:
         display = f"{name} ({code})" if name else code
         keyboard.append([InlineKeyboardButton(text=f"🏁 {display}", callback_data=f"close_test_{code}")])
-    keyboard.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="role_teacher")])
+    keyboard.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="back_home")])
 
     await callback.message.edit_text(
         "Qaysi testni yakunlamoqchisiz?\n"
@@ -1062,7 +1180,7 @@ async def close_test_action(callback: CallbackQuery, bot: Bot):
             )
         ])
     keyboard.append([InlineKeyboardButton(text="🔄 Testni qayta ochish", callback_data=f"reopen_test_{test_code}")])
-    keyboard.append([InlineKeyboardButton(text="◀️ O'qituvchi paneli", callback_data="role_teacher")])
+    keyboard.append([InlineKeyboardButton(text="◀️ O'qituvchi paneli", callback_data="back_home")])
 
     await callback.message.edit_text(
         f"🏁 <b>{test_name}</b> ({test_code}) yakunlandi!\n"
@@ -1096,7 +1214,7 @@ async def view_results_menu(callback: CallbackQuery):
         keyboard.append([
             InlineKeyboardButton(text=f"{status} {display}", callback_data=f"results_{code}")
         ])
-    keyboard.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="role_teacher")])
+    keyboard.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="back_home")])
 
     await callback.message.edit_text(
         "📊 Qaysi test natijalarini ko'rmoqchisiz?",
@@ -1202,7 +1320,7 @@ async def view_student_details(callback: CallbackQuery):
     await callback.answer()
 
 
-# ================== QO'SHIMCHA URINISH (O'QITUVCHI TOMONI) ==================
+# ================== QO'SHIMCHA URINISH (O'QITUVCHI) ==================
 @router.callback_query(F.data.startswith("approve_att_"))
 async def approve_attempt(callback: CallbackQuery, bot: Bot):
     req_id = int(callback.data.replace("approve_att_", ""))
@@ -1224,7 +1342,6 @@ async def approve_attempt(callback: CallbackQuery, bot: Bot):
         conn.close()
         return
 
-    # O'qituvchi ekanligini tekshirish
     cursor.execute("SELECT teacher_id, name FROM tests WHERE code = ?", (test_code,))
     t_row = cursor.fetchone()
     if not t_row or t_row[0] != callback.from_user.id:
@@ -1234,15 +1351,12 @@ async def approve_attempt(callback: CallbackQuery, bot: Bot):
 
     test_name = t_row[1] or test_code
 
-    # So'rovni tasdiqlash
     cursor.execute("UPDATE attempt_requests SET status = 'approved' WHERE id = ?", (req_id,))
-    # Eski natijani o'chirish → o'quvchi qayta ishlashi mumkin
     cursor.execute("DELETE FROM student_results WHERE test_code = ? AND student_id = ?",
                    (test_code, student_id))
     conn.commit()
     conn.close()
 
-    # O'quvchiga xabar
     try:
         await bot.send_message(
             student_id,
@@ -1324,12 +1438,9 @@ async def reject_attempt(callback: CallbackQuery, bot: Bot):
 # ================== O'QUVCHI ==================
 @router.callback_query(F.data == "role_student")
 async def role_student(callback: CallbackQuery, state: FSMContext):
+    set_user_role(callback.from_user.id, "student")
     await state.clear()
-    await callback.message.edit_text(
-        "👨‍🎓 <b>O'quvchi bo'limi</b>\n\nKerakli amalni tanlang:",
-        reply_markup=student_panel(),
-        parse_mode=ParseMode.HTML
-    )
+    await show_home_by_role(callback, callback.from_user.id, edit=True)
     await callback.answer()
 
 
@@ -1379,7 +1490,6 @@ async def my_history(callback: CallbackQuery):
             f"Holat: {status}\n"
             f"────────────────\n"
         )
-        # Faqat faol testlar uchun "1 ta urinish qo'shish" tugmasi
         if is_active:
             keyboard.append([
                 InlineKeyboardButton(
@@ -1388,7 +1498,7 @@ async def my_history(callback: CallbackQuery):
                 )
             ])
 
-    keyboard.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="role_student")])
+    keyboard.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="back_home")])
 
     await callback.message.edit_text(
         text,
@@ -1398,7 +1508,6 @@ async def my_history(callback: CallbackQuery):
     await callback.answer()
 
 
-# ========== QO'SHIMCHA URINISH SO'ROVI ==========
 @router.callback_query(F.data.startswith("req_att_"))
 async def request_attempt_start(callback: CallbackQuery, state: FSMContext):
     test_code = callback.data.replace("req_att_", "")
@@ -1406,7 +1515,6 @@ async def request_attempt_start(callback: CallbackQuery, state: FSMContext):
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Test hali faolmi?
     cursor.execute("SELECT is_active, name, teacher_id FROM tests WHERE code = ?", (test_code,))
     t_row = cursor.fetchone()
     if not t_row or t_row[0] == 0:
@@ -1414,7 +1522,6 @@ async def request_attempt_start(callback: CallbackQuery, state: FSMContext):
         conn.close()
         return
 
-    # Allaqachon ishlaganmi?
     cursor.execute(
         "SELECT 1 FROM student_results WHERE test_code = ? AND student_id = ?",
         (test_code, callback.from_user.id)
@@ -1424,7 +1531,6 @@ async def request_attempt_start(callback: CallbackQuery, state: FSMContext):
         conn.close()
         return
 
-    # Pending so'rov bormi?
     cursor.execute(
         "SELECT 1 FROM attempt_requests WHERE test_code = ? AND student_id = ? AND status = 'pending'",
         (test_code, callback.from_user.id)
@@ -1488,7 +1594,6 @@ async def process_attempt_reason(message: Message, state: FSMContext, bot: Bot):
 
     await state.clear()
 
-    # O'qituvchiga so'rov yuborish
     try:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -1559,10 +1664,9 @@ async def process_student_code(message: Message, state: FSMContext, bot: Bot):
     )
     existing = cursor.fetchone()
     if existing:
-        # Allaqachon ishlagan → qo'shimcha urinish so'rash imkoniyatini beramiz
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➕ 1 ta urinish qo'shish", callback_data=f"req_att_{test_code}")],
-            [InlineKeyboardButton(text="◀️ Orqaga", callback_data="role_student")],
+            [InlineKeyboardButton(text="◀️ Orqaga", callback_data="back_home")],
         ])
         await message.answer(
             f"ℹ️ Siz bu testni allaqachon ishlagansiz.\n"
@@ -1657,7 +1761,6 @@ async def process_student_answers(message: Message, state: FSMContext, bot: Bot)
     conn.close()
     await state.clear()
 
-    # O'qituvchiga bildirishnoma
     try:
         percent = (score / total * 100) if total else 0
         await bot.send_message(
@@ -1673,14 +1776,13 @@ async def process_student_answers(message: Message, state: FSMContext, bot: Bot)
     except Exception as e:
         logger.warning(f"Could not notify teacher {teacher_id}: {e}")
 
-    is_admin = message.from_user.id == SUPER_ADMIN_ID
     await message.answer(
         f"✅ <b>Javoblaringiz qabul qilindi!</b>\n\n"
         f"📌 Test: <b>{test_name}</b>\n"
         f"🔑 Kod: <code>{test_code}</code>\n\n"
         f"📊 Ballingiz o'qituvchi testni yakunlagandan keyin batafsil tahlil bilan birga yuboriladi.\n\n"
         f"Agar yana ishlamoqchi bo'lsangiz, «Mening natijalarim» bo'limidan so'rov yuborishingiz mumkin.",
-        reply_markup=main_menu(is_admin),
+        reply_markup=student_panel(),
         parse_mode=ParseMode.HTML
     )
 
