@@ -1,5 +1,4 @@
 import asyncio
-from datetime import datetime, timedelta
 import logging
 import random
 import string
@@ -16,17 +15,17 @@ from aiogram.types import (
 )
 
 TOKEN = "8929740278:AAEKrylhzDQ__qQLaqLFyHadEytfMu8ADwM"
-SUPER_ADMIN_ID = 7393342078  # O'z Telegram ID raqamingizni yozing
+SUPER_ADMIN_ID = 7393342078  # O'z Telegram ID raqamingiz
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
 
 # --- BAZA BILAN ISHLASH ---
 def init_db():
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
     
-    # Testlar jadvali
+    # Testlar jadvali (vaqt ustunlarisiz)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tests (
             code TEXT PRIMARY KEY,
@@ -34,9 +33,6 @@ def init_db():
             file_id TEXT,
             file_type TEXT,
             answers TEXT,
-            duration_minutes INTEGER,
-            start_time TEXT,
-            expires_at TEXT,
             is_active INTEGER DEFAULT 1
         )
     """)
@@ -51,8 +47,6 @@ def init_db():
             student_answers TEXT,
             score INTEGER,
             total INTEGER,
-            time_taken TEXT,
-            started_at TEXT,
             FOREIGN KEY(test_code) REFERENCES tests(code)
         )
     """)
@@ -75,7 +69,6 @@ init_db()
 class TeacherStates(StatesGroup):
     waiting_for_file = State()
     waiting_for_answers = State()
-    waiting_for_duration = State()
 
 class StudentStates(StatesGroup):
     waiting_for_test_code = State()
@@ -89,7 +82,7 @@ class AdminStates(StatesGroup):
 
 # --- MAJBURIY OBUNANI TEKSHIRISH ---
 async def check_subscription(bot: Bot, user_id: int) -> bool:
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
     cursor.execute("SELECT channel_id, channel_link, channel_name FROM channels")
     channels = cursor.fetchall()
@@ -104,12 +97,11 @@ async def check_subscription(bot: Bot, user_id: int) -> bool:
             if member.status in ["left", "kicked"]:
                 return False
         except Exception:
-            # Agar bot kanalga qo'shilmagan bo'lsa yoki xatolik bo'lsa
             pass
     return True
 
 async def get_subscription_markup():
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
     cursor.execute("SELECT channel_link, channel_name FROM channels")
     channels = cursor.fetchall()
@@ -228,7 +220,7 @@ async def get_ch_link(message: Message, state: FSMContext):
     ch_name = data.get("ch_name")
     ch_link = message.text.strip()
     
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
     cursor.execute("INSERT OR REPLACE INTO channels (channel_id, channel_name, channel_link) VALUES (?, ?, ?)", (ch_id, ch_name, ch_link))
     conn.commit()
@@ -239,7 +231,7 @@ async def get_ch_link(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "del_channel")
 async def del_channel_menu(callback: CallbackQuery):
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
     cursor.execute("SELECT channel_id, channel_name FROM channels")
     channels = cursor.fetchall()
@@ -259,7 +251,7 @@ async def del_channel_menu(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("remove_ch_"))
 async def remove_channel_action(callback: CallbackQuery):
     ch_id = callback.data.replace("remove_ch_", "")
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
     cursor.execute("DELETE FROM channels WHERE channel_id = ?", (ch_id,))
     conn.commit()
@@ -291,32 +283,17 @@ async def process_test_file(message: Message, state: FSMContext):
 @router.message(TeacherStates.waiting_for_answers)
 async def process_test_answers(message: Message, state: FSMContext):
     answers = message.text.strip()
-    await state.update_data(answers=answers)
-    await message.answer("Endi test uchun **vaqtni daqiqalarda** kiriting (masalan: `60` - 1 soat uchun):")
-    await state.set_state(TeacherStates.waiting_for_duration)
-
-@router.message(TeacherStates.waiting_for_duration)
-async def process_test_duration(message: Message, state: FSMContext):
-    try:
-        duration = int(message.text.strip())
-    except ValueError:
-        await message.answer("Iltimos, faqat raqam kiriting (masalan: 30, 60):")
-        return
-        
     data = await state.get_data()
     file_id = data.get("file_id")
     file_type = data.get("file_type")
-    answers = data.get("answers")
     
     test_code = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
-    now = datetime.now()
-    expires_at = now + timedelta(minutes=duration)
     
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO tests (code, teacher_id, file_id, file_type, answers, duration_minutes, start_time, expires_at, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
-        (test_code, message.from_user.id, file_id, file_type, answers, duration, now.isoformat(), expires_at.isoformat())
+        "INSERT INTO tests (code, teacher_id, file_id, file_type, answers, is_active) VALUES (?, ?, ?, ?, ?, 1)",
+        (test_code, message.from_user.id, file_id, file_type, answers)
     )
     conn.commit()
     conn.close()
@@ -324,18 +301,17 @@ async def process_test_duration(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✅ **Test yaratildi!**\n\n"
-        f"🔑 Test kodi: `{test_code}`\n"
-        f"⏳ Davomiyligi: {duration} daqiqa\n"
-        f"⏰ Tugash vaqti: {expires_at.strftime('%Y-%m-%d %H:%M')}",
+        f"🔑 Test kodi: `{test_code}`\n\n"
+        f"O'quvchilarga shu kodni yuboring.",
         reply_markup=teacher_panel(),
         parse_mode="Markdown"
     )
 
 @router.callback_query(F.data == "finish_test_menu")
 async def finish_test_menu(callback: CallbackQuery):
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT code, expires_at FROM tests WHERE teacher_id = ? AND is_active = 1", (callback.from_user.id,))
+    cursor.execute("SELECT code FROM tests WHERE teacher_id = ? AND is_active = 1", (callback.from_user.id,))
     tests = cursor.fetchall()
     conn.close()
     
@@ -354,33 +330,30 @@ async def finish_test_menu(callback: CallbackQuery):
 async def close_test_action(callback: CallbackQuery, bot: Bot):
     test_code = callback.data.replace("close_test_", "")
     
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
     cursor.execute("UPDATE tests SET is_active = 0 WHERE code = ?", (test_code,))
     
-    # Natijalarni olish
-    cursor.execute("SELECT student_id, student_name, score, total, time_taken FROM student_results WHERE test_code = ?", (test_code,))
+    cursor.execute("SELECT student_id, student_name, score, total FROM student_results WHERE test_code = ?", (test_code,))
     results = cursor.fetchall()
     conn.commit()
     conn.close()
     
     # O'quvchilarga natijalarni yuborish
     for r in results:
-        st_id, st_name, score, total, t_taken = r
+        st_id, st_name, score, total = r
         try:
             await bot.send_message(
                 st_id,
                 f"🏁 **{test_code}**-kodli test yakunlandi!\n\n"
-                f"📊 Natijangiz: **{score} / {total}**\n"
-                f"⏱ Sarflangan vaqt: {t_taken}"
+                f"📊 Natijangiz: **{score} / {total}**"
             )
         except Exception:
             pass
             
-    # O'qituvchiga natijalar ro'yxatini chiqarish
     keyboard = []
     for r in results:
-        st_id, st_name, score, total, t_taken = r
+        st_id, st_name, score, total = r
         keyboard.append([InlineKeyboardButton(text=f"{st_name} ({score}/{total})", callback_data=f"view_st_{test_code}_{st_id}")])
     keyboard.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="role_teacher")])
     
@@ -397,9 +370,9 @@ async def view_student_details(callback: CallbackQuery):
     test_code = parts[2]
     student_id = int(parts[3])
     
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT student_name, student_answers, score, total, time_taken FROM student_results WHERE test_code = ? AND student_id = ?", (test_code, student_id))
+    cursor.execute("SELECT student_name, student_answers, score, total FROM student_results WHERE test_code = ? AND student_id = ?", (test_code, student_id))
     res = cursor.fetchone()
     
     cursor.execute("SELECT answers FROM tests WHERE code = ?", (test_code,))
@@ -410,14 +383,13 @@ async def view_student_details(callback: CallbackQuery):
         await callback.answer("Ma'lumot topilmadi", show_alert=True)
         return
         
-    st_name, st_ans, score, total, t_taken = res
+    st_name, st_ans, score, total = res
     correct_ans = t_data[0]
     
-    # Xatoliklarni solishtirish uchun parse qilish
     st_list = [x.strip() for x in st_ans.replace(",", " ").split()]
     corr_list = [x.strip() for x in correct_ans.replace(",", " ").split()]
     
-    details = f"👤 O'quvchi: **{st_name}**\n📊 Ball: **{score}/{total}**\n⏱ Vaqt: {t_taken}\n\n**Savollar tahlili:**\n"
+    details = f"👤 O'quvchi: **{st_name}**\n📊 Ball: **{score}/{total}**\n\n**Savollar tahlili:**\n"
     for i in range(max(len(st_list), len(corr_list))):
         s_val = st_list[i] if i < len(st_list) else "-"
         c_val = corr_list[i] if i < len(corr_list) else "-"
@@ -441,9 +413,9 @@ async def role_student(callback: CallbackQuery, state: FSMContext):
 async def process_student_code(message: Message, state: FSMContext):
     test_code = message.text.strip().upper()
     
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT file_id, file_type, expires_at, is_active FROM tests WHERE code = ?", (test_code,))
+    cursor.execute("SELECT file_id, file_type, is_active FROM tests WHERE code = ?", (test_code,))
     test = cursor.fetchone()
     conn.close()
     
@@ -451,17 +423,14 @@ async def process_student_code(message: Message, state: FSMContext):
         await message.answer("❌ Bunday kodli test topilmadi. Qaytadan kiriting:")
         return
         
-    file_id, file_type, expires_at_str, is_active = test
+    file_id, file_type, is_active = test
     
-    # Vaqtni tekshirish
-    expires_at = datetime.fromisoformat(expires_at_str)
-    if is_active == 0 or datetime.now() > expires_at:
-        await message.answer("❌ Bu test muddati tugagan yoki yakunlangan.")
+    if is_active == 0:
+        await message.answer("❌ Bu test o'qituvchi tomonidan yakunlangan.")
         await state.clear()
         return
         
-    # Boshlanish vaqtini saqlaymiz (vaqtni o'lchash uchun)
-    await state.update_data(test_code=test_code, start_time=datetime.now().isoformat())
+    await state.update_data(test_code=test_code)
     
     if file_type == "document":
         await message.answer_document(file_id, caption="📄 Test fayli. Ishlab bo'lgach javoblaringizni yuboring.")
@@ -475,15 +444,14 @@ async def process_student_code(message: Message, state: FSMContext):
 async def process_student_answers(message: Message, state: FSMContext):
     data = await state.get_data()
     test_code = data.get("test_code")
-    start_time_str = data.get("start_time")
     
-    conn = sqlite3.connect("tests_advanced.db")
+    conn = sqlite3.connect("tests_simple.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT answers, expires_at, is_active FROM tests WHERE code = ?", (test_code,))
+    cursor.execute("SELECT answers, is_active FROM tests WHERE code = ?", (test_code,))
     test_data = cursor.fetchone()
     
-    if not test_data or test_data[2] == 0 or datetime.now() > datetime.fromisoformat(test_data[1]):
-        await message.answer("❌ Test vaqti tugagan yoki yakunlangan.")
+    if not test_data or test_data[1] == 0:
+        await message.answer("❌ Test yakunlangan yoki topilmadi.")
         conn.close()
         await state.clear()
         return
@@ -491,7 +459,6 @@ async def process_student_answers(message: Message, state: FSMContext):
     correct_raw = test_data[0]
     student_raw = message.text.strip()
     
-    # Listga ajratib taqqoslash
     corr_list = [x.strip().lower() for x in correct_raw.replace(",", " ").split()]
     st_list = [x.strip().lower() for x in student_raw.replace(",", " ").split()]
     
@@ -501,28 +468,20 @@ async def process_student_answers(message: Message, state: FSMContext):
         if st_list[i] == corr_list[i]:
             score += 1
             
-    # Sarflangan vaqtni hisoblash
-    start_time = datetime.fromisoformat(start_time_str)
-    diff = datetime.now() - start_time
-    minutes = int(diff.total_seconds() // 60)
-    seconds = int(diff.total_seconds() % 60)
-    time_taken_str = f"{minutes} min {seconds} sek"
-    
     student_name = message.from_user.full_name
     student_id = message.from_user.id
     
     cursor.execute(
-        "INSERT INTO student_results (test_code, student_id, student_name, student_answers, score, total, time_taken, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (test_code, student_id, student_name, student_raw, score, total, time_taken_str, start_time_str)
+        "INSERT INTO student_results (test_code, student_id, student_name, student_answers, score, total) VALUES (?, ?, ?, ?, ?, ?)",
+        (test_code, student_id, student_name, student_raw, score, total)
     )
     conn.commit()
     conn.close()
     
     await state.clear()
     await message.answer(
-        f"✅ **Javoblaringiz qabul qilindi!**\n\n"
-        f"⏱ Sarflangan vaqt: {time_taken_str}\n"
-        f"⏳ O'qituvchi testni yakunlagach, to'liq natijangiz va xatolaringiz sizga yuboriladi.",
+        "✅ **Javoblaringiz qabul qilindi!**\n\n"
+        "⏳ O'qituvchi testni yakunlagach, natijangiz va xatolaringiz sizga yuboriladi.",
         reply_markup=main_menu()
     )
 
@@ -534,7 +493,7 @@ async def main():
     dp.include_router(router)
     
     await bot.delete_webhook(drop_pending_updates=True)
-    print("Bot yangilangan holda ishga tushdi...")
+    print("Bot vaqt cheklovisiz ishga tushdi...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
