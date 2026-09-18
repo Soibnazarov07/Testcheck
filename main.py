@@ -16,7 +16,7 @@ from aiogram.types import (
 )
 
 TOKEN = "8929740278:AAEKrylhzDQ__qQLaqLFyHadEytfMu8ADwM"
-SUPER_ADMIN_ID = ID: 7393342078  # O'z Telegram ID raqamingizni yozing
+SUPER_ADMIN_ID = 7393342078  # O'z Telegram ID raqamingizni yozing
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
