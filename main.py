@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import random
 import string
 import sqlite3
@@ -18,8 +19,11 @@ from aiogram.types import (
 )
 
 # ================== SOZLAMALAR ==================
-TOKEN = "8929740278:AAEKrylhzDQ__qQLaqLFyHadEytfMu8ADwM"  # BotFather dan olingan tokenni yozing
-SUPER_ADMIN_ID = 7393342078   # O'zingizning Telegram ID raqamingiz
+TOKEN = os.getenv("BOT_TOKEN", "8929740278:AAEKrylhzDQ__qQLaqLFyHadEytfMu8ADwM")  # Railway Variables da BOT_TOKEN qo'shing
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "7393342078"))
+
+# Railway Volume uchun: /data papkasiga yoziladi (Volume mount qiling!)
+DB_PATH = os.getenv("DB_PATH", "/data/tests_simple.db")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +35,9 @@ router = Router()
 
 # ================== BAZA ==================
 def get_connection():
-    return sqlite3.connect("tests_simple.db", check_same_thread=False)
+    # /data papkasi mavjudligini ta'minlash
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def init_db():
     conn = get_connection()
@@ -74,7 +80,7 @@ def init_db():
 
     conn.commit()
     conn.close()
-    logger.info("Database initialized")
+    logger.info(f"Database initialized at: {DB_PATH}")
 
 init_db()
 
@@ -105,7 +111,7 @@ async def check_subscription(bot: Bot, user_id: int) -> bool:
     conn.close()
 
     if not channels:
-        return True  # Hech qanday majburiy kanal yo'q
+        return True
 
     for ch_id, ch_link, ch_name in channels:
         try:
@@ -196,6 +202,22 @@ def calculate_score(correct_raw: str, student_raw: str) -> tuple[int, int, list[
         if st_list[i] == corr_list[i]:
             score += 1
     return score, total, st_list, corr_list
+
+
+def format_detailed_result(st_list: list[str], corr_list: list[str], score: int, total: int) -> str:
+    """O'quvchiga ko'rsatiladigan batafsil natija matni."""
+    text = (
+        f"📊 <b>Natijangiz: {score}/{total}</b> "
+        f"({(score / total * 100) if total else 0:.1f}%)\n\n"
+        f"<b>Savollar tahlili:</b>\n"
+    )
+    max_len = max(len(st_list), len(corr_list))
+    for i in range(max_len):
+        s_val = st_list[i] if i < len(st_list) else "—"
+        c_val = corr_list[i] if i < len(corr_list) else "—"
+        status = "✅" if s_val == c_val else "❌"
+        text += f"{i+1}. {status} Sizniki: <code>{s_val}</code> | To'g'ri: <code>{c_val}</code>\n"
+    return text
 
 
 # ================== START VA OBUNA ==================
@@ -599,7 +621,7 @@ async def finish_test_menu(callback: CallbackQuery):
 
     await callback.message.edit_text(
         "Qaysi testni yakunlamoqchisiz?\n"
-        "Yakunlangandan so'ng o'quvchilarga natija yuboriladi va yangi javob qabul qilinmaydi.",
+        "Yakunlangandan so'ng o'quvchilarga qayta xabar yuboriladi.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
     await callback.answer()
@@ -636,8 +658,8 @@ async def close_test_action(callback: CallbackQuery, bot: Bot):
         try:
             await bot.send_message(
                 st_id,
-                f"🏁 <b>{test_code}</b>-kodli test yakunlandi!\n\n"
-                f"📊 Natijangiz: <b>{score} / {total}</b>\n"
+                f"🏁 <b>{test_code}</b>-kodli test o'qituvchi tomonidan yakunlandi!\n\n"
+                f"📊 Yakuniy natijangiz: <b>{score} / {total}</b>\n"
                 f"Foiz: {(score / total * 100) if total else 0:.1f}%",
                 parse_mode=ParseMode.HTML
             )
@@ -930,12 +952,14 @@ async def process_student_answers(message: Message, state: FSMContext, bot: Bot)
     conn.close()
     await state.clear()
 
+    # ===== O'QUVCHIGA TO'LIQ TAHLIL KO'RSATISH =====
+    detailed = format_detailed_result(st_list, corr_list, score, total)
+
     is_admin = message.from_user.id == SUPER_ADMIN_ID
     await message.answer(
-        "✅ <b>Javoblaringiz muvaffaqiyatli qabul qilindi!</b>\n\n"
-        f"Hozircha natija yashirin.\n"
-        f"O'qituvchi testni yakunlagach, sizga to'liq natija va xatolar yuboriladi.\n\n"
-        f"(Javoblar soni: {len(st_list)}, savollar: {total})",
+        f"✅ <b>Javoblaringiz qabul qilindi!</b>\n\n"
+        f"{detailed}\n"
+        f"O'qituvchi testni yakunlagach, sizga qo'shimcha xabar keladi.",
         reply_markup=main_menu(is_admin),
         parse_mode=ParseMode.HTML
     )
@@ -943,8 +967,8 @@ async def process_student_answers(message: Message, state: FSMContext, bot: Bot)
 
 # ================== ASOSIY ==================
 async def main():
-    if TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("⚠️  TOKEN ni o'zgartiring! BotFather dan oling.")
+    if TOKEN == "YOUR_BOT_TOKEN_HERE" or not TOKEN:
+        print("⚠️  BOT_TOKEN ni sozlang! Railway Variables yoki kod ichida.")
         return
 
     bot = Bot(token=TOKEN)
@@ -952,8 +976,8 @@ async def main():
     dp.include_router(router)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Bot ishga tushdi (vaqt cheklovisiz)...")
-    print("✅ Bot muvaffaqiyatli ishga tushdi!")
+    logger.info(f"Bot ishga tushdi. Database: {DB_PATH}")
+    print(f"✅ Bot muvaffaqiyatli ishga tushdi! DB: {DB_PATH}")
     await dp.start_polling(bot)
 
 
