@@ -53,11 +53,10 @@ def init_db():
         )
     """)
 
-    # Eski bazaga name ustunini qo'shish (agar yo'q bo'lsa)
     try:
         cursor.execute("ALTER TABLE tests ADD COLUMN name TEXT DEFAULT ''")
     except sqlite3.OperationalError:
-        pass  # ustun allaqachon bor
+        pass
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS student_results (
@@ -82,6 +81,15 @@ def init_db():
         )
     """)
 
+    # Foydalanuvchilar ism-familiyasi uchun
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT NOT NULL,
+            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
     logger.info(f"Database initialized at: {DB_PATH}")
@@ -102,6 +110,30 @@ class AdminStates(StatesGroup):
     waiting_for_channel_id = State()
     waiting_for_channel_name = State()
     waiting_for_channel_link = State()
+
+class RegisterStates(StatesGroup):
+    waiting_for_fullname = State()
+
+
+# ================== YORDAMCHI FUNKSIYALAR ==================
+def get_user_fullname(user_id: int) -> Optional[str]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT full_name FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def save_user_fullname(user_id: int, full_name: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO users (user_id, full_name) VALUES (?, ?)",
+        (user_id, full_name)
+    )
+    conn.commit()
+    conn.close()
 
 
 # ================== MAJBURIY OBUNA ==================
@@ -220,11 +252,9 @@ def format_detailed_result(st_list: list[str], corr_list: list[str], score: int,
 
 
 def format_ranking(results: list, test_name: str, test_code: str) -> str:
-    """O'qituvchiga yuboriladigan reyting matni"""
     if not results:
         return f"🏁 <b>{test_name}</b> ({test_code}) yakunlandi.\n\nHali hech kim ishlamagan."
 
-    # Ball bo'yicha saralash (yuqoridan pastga)
     sorted_results = sorted(results, key=lambda x: (x[2], x[3]), reverse=True)
 
     text = f"🏆 <b>REYTING</b>\n"
@@ -241,7 +271,7 @@ def format_ranking(results: list, test_name: str, test_code: str) -> str:
     return text
 
 
-# ================== START VA OBUNA ==================
+# ================== START VA RO'YXATDAN O'TISH ==================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
@@ -256,22 +286,70 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         )
         return
 
+    # Ism-familiya tekshirish
+    full_name = get_user_fullname(message.from_user.id)
+    if not full_name:
+        await message.answer(
+            "👋 Assalomu alaykum!\n\n"
+            "Botdan foydalanish uchun <b>ism va familiyangizni</b> yozing:\n"
+            "Masalan: <code>Ali Valiyev</code>\n\n"
+            "Bekor qilish: /cancel",
+            parse_mode=ParseMode.HTML
+        )
+        await state.set_state(RegisterStates.waiting_for_fullname)
+        return
+
     is_admin = message.from_user.id == SUPER_ADMIN_ID
     await message.answer(
-        "Assalomu alaykum! 👋\n"
+        f"Assalomu alaykum, <b>{full_name}</b>! 👋\n"
         "Test botiga xush kelibsiz.\n\n"
         "Iltimos, o'z rolingizni tanlang:",
-        reply_markup=main_menu(is_admin)
+        reply_markup=main_menu(is_admin),
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(RegisterStates.waiting_for_fullname)
+async def process_fullname(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not name or len(name) < 3:
+        await message.answer("Ism-familiya juda qisqa. To'liq yozing (masalan: Ali Valiyev) yoki /cancel")
+        return
+
+    save_user_fullname(message.from_user.id, name)
+    await state.clear()
+
+    is_admin = message.from_user.id == SUPER_ADMIN_ID
+    await message.answer(
+        f"✅ Rahmat, <b>{name}</b>!\n\n"
+        "Endi o'z rolingizni tanlang:",
+        reply_markup=main_menu(is_admin),
+        parse_mode=ParseMode.HTML
     )
 
 
 @router.callback_query(F.data == "check_sub")
-async def check_sub_callback(callback: CallbackQuery, bot: Bot):
+async def check_sub_callback(callback: CallbackQuery, bot: Bot, state: FSMContext):
     if await check_subscription(bot, callback.from_user.id):
+        full_name = get_user_fullname(callback.from_user.id)
+        if not full_name:
+            await callback.message.edit_text(
+                "✅ Rahmat! Obuna tasdiqlandi.\n\n"
+                "Endi <b>ism va familiyangizni</b> yozing:\n"
+                "Masalan: <code>Ali Valiyev</code>",
+                parse_mode=ParseMode.HTML
+            )
+            await state.set_state(RegisterStates.waiting_for_fullname)
+            await callback.answer("Obuna tasdiqlandi!")
+            return
+
         is_admin = callback.from_user.id == SUPER_ADMIN_ID
         await callback.message.edit_text(
-            "✅ Rahmat! Obuna tasdiqlandi.\n\nRolingizni tanlang:",
-            reply_markup=main_menu(is_admin)
+            f"✅ Rahmat! Obuna tasdiqlandi.\n\n"
+            f"Assalomu alaykum, <b>{full_name}</b>!\n"
+            "Rolingizni tanlang:",
+            reply_markup=main_menu(is_admin),
+            parse_mode=ParseMode.HTML
         )
         await callback.answer("Obuna tasdiqlandi!")
     else:
@@ -282,9 +360,12 @@ async def check_sub_callback(callback: CallbackQuery, bot: Bot):
 async def back_home(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     is_admin = callback.from_user.id == SUPER_ADMIN_ID
+    full_name = get_user_fullname(callback.from_user.id) or "Foydalanuvchi"
     await callback.message.edit_text(
+        f"Assalomu alaykum, <b>{full_name}</b>!\n"
         "Iltimos, o'z rolingizni tanlang:",
-        reply_markup=main_menu(is_admin)
+        reply_markup=main_menu(is_admin),
+        parse_mode=ParseMode.HTML
     )
     await callback.answer()
 
@@ -297,6 +378,16 @@ async def cmd_cancel(message: Message, state: FSMContext):
         return
     await state.clear()
     is_admin = message.from_user.id == SUPER_ADMIN_ID
+    full_name = get_user_fullname(message.from_user.id)
+    if not full_name:
+        await message.answer(
+            "❌ Jarayon bekor qilindi.\n\n"
+            "Botdan foydalanish uchun <b>ism va familiyangizni</b> yozing:",
+            parse_mode=ParseMode.HTML
+        )
+        await state.set_state(RegisterStates.waiting_for_fullname)
+        return
+
     await message.answer(
         "❌ Jarayon bekor qilindi.\n\nRolingizni tanlang:",
         reply_markup=main_menu(is_admin)
@@ -695,7 +786,7 @@ async def finish_test_menu(callback: CallbackQuery):
 
     await callback.message.edit_text(
         "Qaysi testni yakunlamoqchisiz?\n"
-        "Yakunlangandan so'ng reyting chiqadi va o'quvchilarga xabar yuboriladi.",
+        "Yakunlangandan so'ng reyting chiqadi va o'quvchilarga batafsil natija yuboriladi.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
     await callback.answer()
@@ -707,7 +798,7 @@ async def close_test_action(callback: CallbackQuery, bot: Bot):
 
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT teacher_id, is_active, name FROM tests WHERE code = ?", (test_code,))
+    cursor.execute("SELECT teacher_id, is_active, name, answers FROM tests WHERE code = ?", (test_code,))
     row = cursor.fetchone()
     if not row or row[0] != callback.from_user.id:
         await callback.answer("Bu test sizniki emas yoki topilmadi.", show_alert=True)
@@ -719,38 +810,43 @@ async def close_test_action(callback: CallbackQuery, bot: Bot):
         return
 
     test_name = row[2] or "Nomsiz test"
+    correct_raw = row[3]
 
     cursor.execute("UPDATE tests SET is_active = 0 WHERE code = ?", (test_code,))
     cursor.execute(
-        "SELECT student_id, student_name, score, total FROM student_results WHERE test_code = ?",
+        "SELECT student_id, student_name, student_answers, score, total FROM student_results WHERE test_code = ?",
         (test_code,)
     )
     results = cursor.fetchall()
     conn.commit()
     conn.close()
 
-    # O'quvchilarga xabar
+    # O'quvchilarga batafsil natija yuborish (endi shu yerda yuboriladi)
     sent = 0
-    for st_id, st_name, score, total in results:
+    for st_id, st_name, st_answers, score, total in results:
         try:
+            st_list = parse_answers(st_answers)
+            corr_list = parse_answers(correct_raw)
+            detailed = format_detailed_result(st_list, corr_list, score, total)
+
             await bot.send_message(
                 st_id,
                 f"🏁 <b>{test_name}</b> ({test_code}) test yakunlandi!\n\n"
-                f"📊 Natijangiz: <b>{score} / {total}</b>\n"
-                f"Foiz: {(score / total * 100) if total else 0:.1f}%",
+                f"{detailed}",
                 parse_mode=ParseMode.HTML
             )
             sent += 1
         except Exception as e:
             logger.warning(f"Could not send result to {st_id}: {e}")
 
-    # ===== O'QITUVCHIGA REYTING =====
-    ranking_text = format_ranking(results, test_name, test_code)
+    # O'qituvchiga reyting
+    ranking_results = [(r[0], r[1], r[3], r[4]) for r in results]  # id, name, score, total
+    ranking_text = format_ranking(ranking_results, test_name, test_code)
     await callback.message.answer(ranking_text, parse_mode=ParseMode.HTML)
 
     # Natijalar ro'yxati tugmalari
     keyboard = []
-    for st_id, st_name, score, total in results:
+    for st_id, st_name, _, score, total in results:
         keyboard.append([
             InlineKeyboardButton(
                 text=f"{st_name} ({score}/{total})",
@@ -762,7 +858,7 @@ async def close_test_action(callback: CallbackQuery, bot: Bot):
 
     await callback.message.edit_text(
         f"🏁 <b>{test_name}</b> ({test_code}) yakunlandi!\n"
-        f"Natijalar {sent} ta o'quvchiga yuborildi.\n\n"
+        f"Batafsil natijalar {sent} ta o'quvchiga yuborildi.\n\n"
         f"Batafsil ko'rish uchun ismini bosing:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
         parse_mode=ParseMode.HTML
@@ -826,7 +922,6 @@ async def show_results(callback: CallbackQuery):
         await callback.answer("Hali hech kim ishlamagan.", show_alert=True)
         return
 
-    # Reyting matnini ham ko'rsatamiz
     ranking = format_ranking(results, test_name, test_code)
 
     keyboard = []
@@ -955,7 +1050,8 @@ async def process_student_code(message: Message, state: FSMContext, bot: Bot):
         await message.answer(
             f"ℹ️ Siz bu testni allaqachon ishlagansiz.\n"
             f"Natijangiz: <b>{existing[0]}/{existing[1]}</b>\n\n"
-            "Yana ishlash mumkin emas (bitta urinish).",
+            "Yana ishlash mumkin emas (bitta urinish).\n"
+            "Batafsil tahlil o'qituvchi testni yakunlagach keladi.",
             parse_mode=ParseMode.HTML
         )
         await state.clear()
@@ -1016,7 +1112,11 @@ async def process_student_answers(message: Message, state: FSMContext, bot: Bot)
 
     score, total, st_list, corr_list = calculate_score(correct_raw, student_raw)
 
-    student_name = message.from_user.full_name or f"User {message.from_user.id}"
+    # Saqlangan ism-familiyani olish
+    student_name = get_user_fullname(message.from_user.id)
+    if not student_name:
+        student_name = message.from_user.full_name or f"User {message.from_user.id}"
+
     student_id = message.from_user.id
 
     try:
@@ -1035,14 +1135,15 @@ async def process_student_answers(message: Message, state: FSMContext, bot: Bot)
     conn.close()
     await state.clear()
 
-    detailed = format_detailed_result(st_list, corr_list, score, total)
-
+    # ★★★ MUHIM: Batafsil javoblar KO'RSATILMAYDI ★★★
+    # Faqat qabul qilinganligi haqida xabar
     is_admin = message.from_user.id == SUPER_ADMIN_ID
     await message.answer(
-        f"✅ <b>Javoblaringiz qabul qilindi!</b>\n"
-        f"📌 Test: <b>{test_name}</b>\n\n"
-        f"{detailed}\n"
-        f"O'qituvchi testni yakunlagach, sizga qo'shimcha xabar keladi.",
+        f"✅ <b>Javoblaringiz qabul qilindi!</b>\n\n"
+        f"📌 Test: <b>{test_name}</b>\n"
+        f"🔑 Kod: <code>{test_code}</code>\n\n"
+        f"📊 Ballingiz o'qituvchi testni yakunlagandan keyin batafsil tahlil bilan birga yuboriladi.\n\n"
+        f"Kuting...",
         reply_markup=main_menu(is_admin),
         parse_mode=ParseMode.HTML
     )
