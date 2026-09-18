@@ -89,6 +89,19 @@ def init_db():
         )
     """)
 
+    # Qo'shimcha urinish so'rovlari
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attempt_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            test_code TEXT NOT NULL,
+            student_id INTEGER NOT NULL,
+            student_name TEXT,
+            reason TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
     logger.info(f"Database initialized at: {DB_PATH}")
@@ -100,7 +113,6 @@ class TeacherStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_file = State()
     waiting_for_answers = State()
-    # Tahrirlash uchun
     editing_name = State()
     editing_answers = State()
     editing_file = State()
@@ -108,6 +120,7 @@ class TeacherStates(StatesGroup):
 class StudentStates(StatesGroup):
     waiting_for_test_code = State()
     waiting_for_student_answers = State()
+    waiting_for_attempt_reason = State()   # yangi
 
 class AdminStates(StatesGroup):
     waiting_for_channel_id = State()
@@ -140,7 +153,6 @@ def save_user_fullname(user_id: int, full_name: str):
 
 
 def get_questions_count(answers_raw: str) -> int:
-    """Kalitlardan savollar sonini hisoblash"""
     return len(parse_answers(answers_raw))
 
 
@@ -1190,6 +1202,125 @@ async def view_student_details(callback: CallbackQuery):
     await callback.answer()
 
 
+# ================== QO'SHIMCHA URINISH (O'QITUVCHI TOMONI) ==================
+@router.callback_query(F.data.startswith("approve_att_"))
+async def approve_attempt(callback: CallbackQuery, bot: Bot):
+    req_id = int(callback.data.replace("approve_att_", ""))
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT test_code, student_id, student_name, status FROM attempt_requests WHERE id = ?",
+        (req_id,)
+    )
+    row = cursor.fetchone()
+    if not row:
+        await callback.answer("So'rov topilmadi.", show_alert=True)
+        conn.close()
+        return
+
+    test_code, student_id, student_name, status = row
+    if status != "pending":
+        await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+        conn.close()
+        return
+
+    # O'qituvchi ekanligini tekshirish
+    cursor.execute("SELECT teacher_id, name FROM tests WHERE code = ?", (test_code,))
+    t_row = cursor.fetchone()
+    if not t_row or t_row[0] != callback.from_user.id:
+        await callback.answer("Sizda huquq yo'q.", show_alert=True)
+        conn.close()
+        return
+
+    test_name = t_row[1] or test_code
+
+    # So'rovni tasdiqlash
+    cursor.execute("UPDATE attempt_requests SET status = 'approved' WHERE id = ?", (req_id,))
+    # Eski natijani o'chirish → o'quvchi qayta ishlashi mumkin
+    cursor.execute("DELETE FROM student_results WHERE test_code = ? AND student_id = ?",
+                   (test_code, student_id))
+    conn.commit()
+    conn.close()
+
+    # O'quvchiga xabar
+    try:
+        await bot.send_message(
+            student_id,
+            f"✅ <b>Urinish qo'shildi!</b>\n\n"
+            f"📌 Test: <b>{test_name}</b>\n"
+            f"🔑 Kod: <code>{test_code}</code>\n\n"
+            f"O'qituvchi sizning so'rovingizni tasdiqladi.\n"
+            f"Endi testni qayta ishlashingiz mumkin.",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.warning(f"Could not notify student {student_id}: {e}")
+
+    await callback.message.edit_text(
+        f"✅ So'rov tasdiqlandi!\n\n"
+        f"👤 {student_name}\n"
+        f"📌 {test_name} ({test_code})\n\n"
+        f"O'quvchiga 1 ta qo'shimcha urinish berildi.",
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer("Tasdiqlandi!")
+
+
+@router.callback_query(F.data.startswith("reject_att_"))
+async def reject_attempt(callback: CallbackQuery, bot: Bot):
+    req_id = int(callback.data.replace("reject_att_", ""))
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT test_code, student_id, student_name, status FROM attempt_requests WHERE id = ?",
+        (req_id,)
+    )
+    row = cursor.fetchone()
+    if not row:
+        await callback.answer("So'rov topilmadi.", show_alert=True)
+        conn.close()
+        return
+
+    test_code, student_id, student_name, status = row
+    if status != "pending":
+        await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+        conn.close()
+        return
+
+    cursor.execute("SELECT teacher_id, name FROM tests WHERE code = ?", (test_code,))
+    t_row = cursor.fetchone()
+    if not t_row or t_row[0] != callback.from_user.id:
+        await callback.answer("Sizda huquq yo'q.", show_alert=True)
+        conn.close()
+        return
+
+    test_name = t_row[1] or test_code
+
+    cursor.execute("UPDATE attempt_requests SET status = 'rejected' WHERE id = ?", (req_id,))
+    conn.commit()
+    conn.close()
+
+    try:
+        await bot.send_message(
+            student_id,
+            f"❌ <b>So'rovingiz rad etildi</b>\n\n"
+            f"📌 Test: <b>{test_name}</b>\n"
+            f"🔑 Kod: <code>{test_code}</code>\n\n"
+            f"O'qituvchi qo'shimcha urinish berishni rad etdi.",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.warning(f"Could not notify student {student_id}: {e}")
+
+    await callback.message.edit_text(
+        f"❌ So'rov rad etildi.\n\n"
+        f"👤 {student_name}\n"
+        f"📌 {test_name} ({test_code})",
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer("Rad etildi!")
+
+
 # ================== O'QUVCHI ==================
 @router.callback_query(F.data == "role_student")
 async def role_student(callback: CallbackQuery, state: FSMContext):
@@ -1235,6 +1366,8 @@ async def my_history(callback: CallbackQuery):
         return
 
     text = "📜 <b>Sizning test tarixingiz</b> (oxirgi 30 ta):\n\n"
+    keyboard = []
+
     for code, name, score, total, is_active, submitted in rows:
         name = name or "Nomsiz test"
         status = "🟢 Faol" if is_active else "🔴 Yakunlangan"
@@ -1246,15 +1379,145 @@ async def my_history(callback: CallbackQuery):
             f"Holat: {status}\n"
             f"────────────────\n"
         )
+        # Faqat faol testlar uchun "1 ta urinish qo'shish" tugmasi
+        if is_active:
+            keyboard.append([
+                InlineKeyboardButton(
+                    text=f"➕ 1 ta urinish qo'shish ({code})",
+                    callback_data=f"req_att_{code}"
+                )
+            ])
+
+    keyboard.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="role_student")])
 
     await callback.message.edit_text(
         text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Orqaga", callback_data="role_student")]
-        ]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
         parse_mode=ParseMode.HTML
     )
     await callback.answer()
+
+
+# ========== QO'SHIMCHA URINISH SO'ROVI ==========
+@router.callback_query(F.data.startswith("req_att_"))
+async def request_attempt_start(callback: CallbackQuery, state: FSMContext):
+    test_code = callback.data.replace("req_att_", "")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Test hali faolmi?
+    cursor.execute("SELECT is_active, name, teacher_id FROM tests WHERE code = ?", (test_code,))
+    t_row = cursor.fetchone()
+    if not t_row or t_row[0] == 0:
+        await callback.answer("Bu test allaqachon yakunlangan. Qo'shimcha urinish mumkin emas.", show_alert=True)
+        conn.close()
+        return
+
+    # Allaqachon ishlaganmi?
+    cursor.execute(
+        "SELECT 1 FROM student_results WHERE test_code = ? AND student_id = ?",
+        (test_code, callback.from_user.id)
+    )
+    if not cursor.fetchone():
+        await callback.answer("Siz bu testni hali ishlamagansiz.", show_alert=True)
+        conn.close()
+        return
+
+    # Pending so'rov bormi?
+    cursor.execute(
+        "SELECT 1 FROM attempt_requests WHERE test_code = ? AND student_id = ? AND status = 'pending'",
+        (test_code, callback.from_user.id)
+    )
+    if cursor.fetchone():
+        await callback.answer("Siz allaqachon so'rov yuborgansiz. O'qituvchi javobini kuting.", show_alert=True)
+        conn.close()
+        return
+
+    conn.close()
+
+    await state.update_data(req_test_code=test_code)
+    await callback.message.answer(
+        f"📌 Test kodi: <code>{test_code}</code>\n\n"
+        f"<b>Nima uchun qo'shimcha urinish kerak?</b>\n"
+        f"Sababingizni yozing (masalan: internet uzilib qoldi, xato yubordim...)\n\n"
+        f"Bekor qilish: /cancel",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(StudentStates.waiting_for_attempt_reason)
+    await callback.answer()
+
+
+@router.message(StudentStates.waiting_for_attempt_reason)
+async def process_attempt_reason(message: Message, state: FSMContext, bot: Bot):
+    reason = message.text.strip()
+    if not reason or len(reason) < 5:
+        await message.answer("Sabab juda qisqa. Batafsilroq yozing yoki /cancel")
+        return
+
+    data = await state.get_data()
+    test_code = data.get("req_test_code")
+    if not test_code:
+        await message.answer("Xatolik. /start dan boshlang.")
+        await state.clear()
+        return
+
+    student_name = get_user_fullname(message.from_user.id) or message.from_user.full_name or f"User {message.from_user.id}"
+    student_id = message.from_user.id
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT teacher_id, name FROM tests WHERE code = ?", (test_code,))
+    t_row = cursor.fetchone()
+    if not t_row:
+        await message.answer("Test topilmadi.")
+        conn.close()
+        await state.clear()
+        return
+
+    teacher_id, test_name = t_row
+    test_name = test_name or test_code
+
+    cursor.execute(
+        "INSERT INTO attempt_requests (test_code, student_id, student_name, reason, status) VALUES (?, ?, ?, ?, 'pending')",
+        (test_code, student_id, student_name, reason)
+    )
+    req_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+
+    # O'qituvchiga so'rov yuborish
+    try:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"approve_att_{req_id}"),
+                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject_att_{req_id}"),
+            ]
+        ])
+        await bot.send_message(
+            teacher_id,
+            f"📩 <b>Qo'shimcha urinish so'rovi</b>\n\n"
+            f"👤 O'quvchi: <b>{student_name}</b>\n"
+            f"📌 Test: <b>{test_name}</b>\n"
+            f"🔑 Kod: <code>{test_code}</code>\n\n"
+            f"📝 <b>Sabab:</b>\n{reason}\n\n"
+            f"Tasdiqlaysizmi?",
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.warning(f"Could not send request to teacher {teacher_id}: {e}")
+
+    await message.answer(
+        f"✅ So'rovingiz o'qituvchiga yuborildi!\n\n"
+        f"📌 Test: <b>{test_name}</b>\n"
+        f"🔑 Kod: <code>{test_code}</code>\n\n"
+        f"O'qituvchi javobini kuting.",
+        reply_markup=student_panel(),
+        parse_mode=ParseMode.HTML
+    )
 
 
 @router.message(StudentStates.waiting_for_test_code)
@@ -1296,11 +1559,16 @@ async def process_student_code(message: Message, state: FSMContext, bot: Bot):
     )
     existing = cursor.fetchone()
     if existing:
+        # Allaqachon ishlagan → qo'shimcha urinish so'rash imkoniyatini beramiz
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ 1 ta urinish qo'shish", callback_data=f"req_att_{test_code}")],
+            [InlineKeyboardButton(text="◀️ Orqaga", callback_data="role_student")],
+        ])
         await message.answer(
             f"ℹ️ Siz bu testni allaqachon ishlagansiz.\n"
             f"Natijangiz: <b>{existing[0]}/{existing[1]}</b>\n\n"
-            "Yana ishlash mumkin emas (bitta urinish).\n"
-            "Batafsil tahlil o'qituvchi testni yakunlagach keladi.",
+            f"Yana ishlash uchun o'qituvchidan ruxsat so'rashingiz mumkin.",
+            reply_markup=keyboard,
             parse_mode=ParseMode.HTML
         )
         await state.clear()
@@ -1389,7 +1657,7 @@ async def process_student_answers(message: Message, state: FSMContext, bot: Bot)
     conn.close()
     await state.clear()
 
-    # ★★★ O'qituvchiga bildirishnoma ★★★
+    # O'qituvchiga bildirishnoma
     try:
         percent = (score / total * 100) if total else 0
         await bot.send_message(
@@ -1405,14 +1673,13 @@ async def process_student_answers(message: Message, state: FSMContext, bot: Bot)
     except Exception as e:
         logger.warning(f"Could not notify teacher {teacher_id}: {e}")
 
-    # O'quvchiga faqat qabul qilinganligi
     is_admin = message.from_user.id == SUPER_ADMIN_ID
     await message.answer(
         f"✅ <b>Javoblaringiz qabul qilindi!</b>\n\n"
         f"📌 Test: <b>{test_name}</b>\n"
         f"🔑 Kod: <code>{test_code}</code>\n\n"
         f"📊 Ballingiz o'qituvchi testni yakunlagandan keyin batafsil tahlil bilan birga yuboriladi.\n\n"
-        f"Kuting...",
+        f"Agar yana ishlamoqchi bo'lsangiz, «Mening natijalarim» bo'limidan so'rov yuborishingiz mumkin.",
         reply_markup=main_menu(is_admin),
         parse_mode=ParseMode.HTML
     )
