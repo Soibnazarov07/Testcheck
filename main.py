@@ -18,7 +18,7 @@ from aiogram.types import (
 )
 
 # ================== SOZLAMALAR ==================
-TOKEN = "YOUR_BOT_TOKEN_HERE"  # BotFather dan olingan tokenni yozing
+TOKEN = "8929740278:AAEKrylhzDQ__qQLaqLFyHadEytfMu8ADwM"  # BotFather dan olingan tokenni yozing
 SUPER_ADMIN_ID = 7393342078   # O'zingizning Telegram ID raqamingiz
 
 logging.basicConfig(
